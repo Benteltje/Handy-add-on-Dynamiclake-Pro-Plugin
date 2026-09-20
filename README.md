@@ -1,6 +1,6 @@
 # Handy-add-on-Dynamiclake-Pro-Plugin
 
-To completely make this function follow these steps:
+To get rid of the native overlay follow these steps:
 
 Open Handy settings
 <img width="1732" height="1512" alt="CleanShot 2026-09-20 at 17 17 50@2x" src="https://github.com/user-attachments/assets/be866830-29b6-4d78-8381-dc13b79a6748" />
