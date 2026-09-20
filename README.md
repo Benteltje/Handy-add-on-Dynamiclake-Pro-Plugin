@@ -10,3 +10,5 @@ Go to advanced settings
 
 Set overlay to none
 <img width="1732" height="1512" alt="CleanShot 2026-09-20 at 17 19 27@2x" src="https://github.com/user-attachments/assets/4a1304a2-2f3a-4be4-b4e6-b032cee8cc8e" />
+
+# If you are using a weaker model because u wanted streaming to see the live text, is it recommended to download a better model because streaming doesn't work with this.
