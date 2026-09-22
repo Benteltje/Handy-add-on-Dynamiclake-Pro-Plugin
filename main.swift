@@ -302,7 +302,7 @@ private final class HandyMonitor {
                 "compactLiveActivity": [
                     "leftSlot": [
                         "type": "image", "id": "hv-icon",
-                        "source": "packageFile", "fileName": "icon.png"
+                        "source": "packageFile", "fileName": "icon-pink.png"
                     ] as [String: Any],
                     "rightSlot": rightSlot
                 ] as [String: Any]
