@@ -3,6 +3,7 @@ import Foundation
 private let pluginName = "Handy"
 private let activityID = "handy-voice.listening"
 private let socketEnvironmentKey = "DYNAMICLAKE_JSON_SOCKET"
+private let maxLogBytes: UInt64 = 256 * 1024
 
 private func debugLogPath() -> URL {
     let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -17,7 +18,12 @@ private func debugLog(_ message: String) {
     let line = ts + " " + message + "\n"
     let url = debugLogPath()
     if FileManager.default.fileExists(atPath: url.path),
-       let handle = try? FileHandle(forWritingTo: url) {
+       let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+       let size = attrs[.size] as? NSNumber,
+       size.uint64Value > maxLogBytes {
+        try? FileManager.default.removeItem(at: url)
+    }
+    if let handle = try? FileHandle(forWritingTo: url) {
         defer { try? handle.close() }
         _ = try? handle.seekToEnd()
         try? handle.write(contentsOf: Data(line.utf8))
@@ -94,17 +100,36 @@ private final class JSONSocketClient {
                 throw PluginError.socket("send: " + String(cString: strerror(errno)))
             }
         }
-        debugLog("sent frame " + String(data.count) + " bytes")
-    }
-
-    func sendWithReconnect(_ payload: [String: Any]) throws {
-        if fd < 0 { try connect() }
-        do {
-            try send(payload)
-        } catch {
-            close()
-            try connect()
-            try send(payload)
+        // Try to read a response (non-blocking, best effort)
+        var flags = fcntl(fd, F_GETFL)
+        if flags >= 0 {
+            _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+        }
+        var lenBuf = [UInt8](repeating: 0, count: 4)
+        let lr = Darwin.recv(fd, &lenBuf, 4, 0)
+        if flags >= 0 {
+            _ = fcntl(fd, F_SETFL, flags)
+        }
+        if lr == 4 {
+            let respLen = (UInt32(lenBuf[0]) << 24) | (UInt32(lenBuf[1]) << 16) |
+                          (UInt32(lenBuf[2]) << 8) | UInt32(lenBuf[3])
+            if respLen > 0 && respLen < 1024 * 1024 {
+                var respBuf = [UInt8](repeating: 0, count: Int(respLen))
+                var got = 0
+                while got < Int(respLen) {
+                    let r = respBuf.withUnsafeMutableBytes { ptr in
+                        Darwin.recv(fd, ptr.baseAddress!.advanced(by: got), Int(respLen) - got, 0)
+                    }
+                    if r > 0 { got += r }
+                    else if r == 0 { break }
+                    else if errno == EINTR { continue }
+                    else { break }
+                }
+                if got > 0 {
+                    let respStr = String(bytes: respBuf.prefix(got), encoding: .utf8) ?? "<binary>"
+                    debugLog("response: " + respStr)
+                }
+            }
         }
     }
 }
@@ -183,13 +208,15 @@ private func handyState(_ log: HandyRecordingLog) -> HandyState {
 
 // MARK: - Plugin Main
 
-private var published = false
-
 private final class HandyMonitor {
     private let client: JSONSocketClient
     private var timer: DispatchSourceTimer?
     private var lastState: HandyState = .idle
+    private var published = false
     private let handyLog = HandyRecordingLog()
+    private var progressTimer: DispatchSourceTimer?
+    private var progressValue = 1
+    private var progressTickCount = 0
 
     init(client: JSONSocketClient) { self.client = client }
 
@@ -204,7 +231,65 @@ private final class HandyMonitor {
         dispatchMain()
     }
 
-    private func makePayload(text: String) -> [String: Any] {
+    private func startProgress() {
+        // Alleen resetten als de timer nog niet liep (dus niet bij transcribing→processing)
+        if progressTimer == nil {
+            progressValue = 1
+            progressTickCount = 0
+        }
+        stopProgress()
+        let q = DispatchQueue(label: "com.dynamiclake.handy.progress")
+        let t = DispatchSource.makeTimerSource(queue: q)
+        t.schedule(deadline: .now() + .milliseconds(10), repeating: .milliseconds(10), leeway: .milliseconds(2))
+        t.setEventHandler { [weak self] in self?.progressTick() }
+        t.resume()
+        progressTimer = t
+    }
+
+    private func stopProgress() {
+        progressTimer?.cancel()
+        progressTimer = nil
+    }
+
+    private func progressTick() {
+        progressValue += 1
+        if progressValue > 100 {
+            progressValue = 1
+        }
+        // Elke 100ms (10 ticks) versturen: vloeiender dan 250ms, onder rate limit
+        progressTickCount += 1
+        guard progressTickCount >= 10 else { return }
+        progressTickCount = 0
+        guard published else { return }
+        let statusText: String
+        switch lastState {
+        case .transcribing: statusText = "Transcribing"
+        case .processing: statusText = "Processing"
+        default: return
+        }
+        do {
+            try client.send(makePayload(status: statusText, progress: Double(progressValue) / 100.0))
+        } catch {
+            debugLog("progress error: \(error)")
+        }
+    }
+
+    private func makePayload(status: String, progress: Double? = nil) -> [String: Any] {
+        let sfSymbol = status == "Listening" ? "mic.fill" :
+                       status == "Transcribing" ? "waveform" :
+                       status == "Processing" ? "sparkles" : "mic.fill"
+        let rightSlot: [String: Any]
+        if let p = progress {
+            rightSlot = [
+                "type": "progress", "id": "hv-progress",
+                "value": p, "tint": "pink"
+            ]
+        } else {
+            rightSlot = [
+                "type": "status", "id": "hv-status",
+                "systemImage": sfSymbol, "tint": "pink"
+            ]
+        }
         return [
             "schemaVersion": 1,
             "requestID": "\(published ? "update" : "create")-\(Int(Date().timeIntervalSince1970))",
@@ -216,13 +301,10 @@ private final class HandyMonitor {
             "surfaces": [
                 "compactLiveActivity": [
                     "leftSlot": [
-                        "type": "text", "id": "name",
-                        "text": "Handy", "style": "compact", "tint": "pink"
+                        "type": "image", "id": "hv-icon",
+                        "source": "packageFile", "fileName": "icon.png"
                     ] as [String: Any],
-                    "rightSlot": [
-                        "type": "text", "id": "status",
-                        "text": text, "style": "compact", "tint": "pink"
-                    ] as [String: Any]
+                    "rightSlot": rightSlot
                 ] as [String: Any]
             ] as [String: Any]
         ]
@@ -230,47 +312,46 @@ private final class HandyMonitor {
 
     private func tick() {
         let state = handyState(handyLog)
-        if state != lastState {
-            debugLog("state=" + String(describing: state))
-            lastState = state
-        }
+        guard state != lastState else { return }
+        lastState = state
+        debugLog("state=" + String(describing: state))
 
         if state == .recording && !published {
             do {
-                try client.send(makePayload(text: "Listening"))
+                try client.send(makePayload(status: "Listening"))
                 published = true
                 debugLog("published listening")
             } catch {
                 debugLog("publish error: \(error)")
             }
         } else if state == .transcribing && published {
-            do {
-                try client.send(makePayload(text: "Transcribing"))
-                debugLog("updated transcribing")
-            } catch {
-                debugLog("update error: \(error)")
-            }
+            startProgress()
+            debugLog("started progress (transcribing)")
         } else if state == .processing && published {
-            do {
-                try client.send(makePayload(text: "Processing"))
-                debugLog("updated processing")
-            } catch {
-                debugLog("update error: \(error)")
-            }
+            startProgress()
+            debugLog("started progress (processing)")
         } else if state == .idle && published {
+            stopProgress()
             let payload: [String: Any] = [
                 "schemaVersion": 1,
                 "requestID": "dismiss-\(Int(Date().timeIntervalSince1970))",
                 "type": "dismiss",
                 "activityID": activityID
             ]
-            do {
-                try client.send(payload)
-                published = false
-                debugLog("dismissed")
-            } catch {
-                debugLog("dismiss error: \(error)")
+            // 3x sturen met pauzes: send() gooit niet bij rate limit,
+            // dus bucket moet tijd krijgen om bij te vullen
+            for attempt in 1...3 {
+                do {
+                    try client.send(payload)
+                } catch {
+                    debugLog("dismiss error attempt \(attempt): \(error)")
+                }
+                if attempt < 3 {
+                    usleep(300_000)
+                }
             }
+            published = false
+            debugLog("dismissed")
         }
     }
 }

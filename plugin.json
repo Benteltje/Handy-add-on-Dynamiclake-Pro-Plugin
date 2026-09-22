@@ -2,11 +2,10 @@
   "schemaVersion": 1,
   "identifier": "com.dynamiclake.handy-voice",
   "name": "Handy",
-  "version": "1.0.5",
+  "version": "1.1",
   "developerName": "Benteltje",
   "executable": "handy-voice",
   "arguments": [],
   "icon": "icon.png",
-  "autoStart": true,
-  "supportsSneakPeek": true
+  "autoStart": true
 }
